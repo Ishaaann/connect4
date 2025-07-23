@@ -1,7 +1,16 @@
 #include <iostream>
 #include <vector>
-#include <random>
 #include <algorithm>
+#include <ctime>
+
+// Platform-specific headers for sleep functionality
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+#include <cuda_runtime.h>
 #include <curand_kernel.h>
 
 // Constants for the game board
@@ -83,7 +92,7 @@ bool checkWin(int* board, int player) {
 }
 
 // ===================================================================
-// Device (GPU) Functions & Kernel
+// Device (GPU) Functions & Kernels
 // ===================================================================
 
 // __device__ function: A helper function that runs on the GPU.
@@ -120,21 +129,23 @@ __device__ bool checkWin_device(int* board, int player) {
     return false;
 }
 
+// Kernel to initialize the cuRAND states for each thread
+__global__ void setup_kernel(curandState *state, unsigned long long seed) {
+    int id = threadIdx.x;
+    curand_init(seed, id, 0, &state[id]);
+}
+
 // __global__ function: The CUDA kernel that runs on the GPU.
 // Each thread evaluates one possible move.
 __global__ void evaluateMoves(int* board, int player, int* scores, curandState* states) {
     int col = threadIdx.x; // Each thread takes one column (0-6)
     if (col >= COLS) return;
 
-    // Create a temporary board in shared memory for this thread's simulation
-    __shared__ int temp_board[ROWS * COLS];
-    
-    // Each thread copies the global board to its local temp board
-    // This is a simplification; for larger boards, use thread-local memory.
+    // Create a temporary board in this thread's local memory for simulation.
+    int temp_board[ROWS * COLS];
     for(int i = 0; i < ROWS * COLS; ++i) {
         temp_board[i] = board[i];
     }
-    __syncthreads(); // Wait for all threads to finish copying
 
     // Find the first empty row in the assigned column
     int row = -1;
@@ -170,20 +181,17 @@ __global__ void evaluateMoves(int* board, int player, int* scores, curandState* 
                 temp_board[next_row * COLS + next_col] = opponent;
                 if (checkWin_device(temp_board, opponent)) {
                     scores[col] = 50; // Good score for a blocking move
-                    // Undo opponent's hypothetical move
                     temp_board[next_row * COLS + next_col] = EMPTY; 
                     return;
                 }
-                // Undo opponent's hypothetical move
                 temp_board[next_row * COLS + next_col] = EMPTY;
             }
         }
         
         // 3. If no immediate win or block, assign a random small score
-        // This makes the AI's choice non-deterministic when no critical moves exist.
         curandState localState = states[col];
         scores[col] = curand_uniform(&localState) * 10; // Score between 0 and 10
-        states[col] = localState;
+        states[col] = localState; // Update the state
 
     } else {
         scores[col] = -1; // Invalid move (column is full)
@@ -208,10 +216,9 @@ int main() {
     cudaMalloc(&d_scores, COLS * sizeof(int));
     cudaMalloc(&d_states, COLS * sizeof(curandState));
     
-    // --- Initialize CUDA Random Number Generator ---
-    curandCreateGenerator(&d_states, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(d_states, time(NULL));
-
+    // --- Initialize CUDA Random Number Generator States ---
+    setup_kernel<<<1, COLS>>>(d_states, time(NULL));
+    cudaDeviceSynchronize();
 
     int currentPlayer = PLAYER_X;
     int turn = 0;
@@ -227,7 +234,6 @@ int main() {
         cudaMemcpy(d_board, h_board, ROWS * COLS * sizeof(int), cudaMemcpyHostToDevice);
 
         // 2. Launch the Kernel to evaluate moves in parallel
-        // We launch 1 block with 7 threads (one for each column)
         evaluateMoves<<<1, COLS>>>(d_board, currentPlayer, d_scores, d_states);
         cudaDeviceSynchronize(); // Wait for the kernel to finish
 
@@ -244,18 +250,15 @@ int main() {
             }
         }
         
-        // If no valid move was found, something is wrong, but we'll break.
         if (bestMove == -1) {
-            std::cout << "No valid moves found!" << std::endl;
+            std::cout << "No valid moves found! It's a draw." << std::endl;
             break;
         }
 
         // 5. Make the chosen move on the host board
-        int row = -1;
         for (int r = ROWS - 1; r >= 0; --r) {
             if (h_board[r * COLS + bestMove] == EMPTY) {
                 h_board[r * COLS + bestMove] = currentPlayer;
-                row = r;
                 break;
             }
         }
@@ -281,10 +284,8 @@ int main() {
         
         // Add a small delay to make the game watchable
         #ifdef _WIN32
-        #include <windows.h>
         Sleep(1000); // 1 second delay
         #else
-        #include <unistd.h>
         usleep(1000000); // 1 second delay
         #endif
     }
